@@ -37,7 +37,7 @@ const PORTAL_REQUEST_PATH_PREFIX: &str = "/org/freedesktop/portal/desktop/reques
 pub(super) async fn start_dbus_gateway(
     svc: Arc<AsyncMutex<GatewayService>>,
 ) -> Result<Connection, zbus::Error> {
-    zbus::connection::Builder::session()
+    let connection = zbus::connection::Builder::session()
         .inspect_err(|err| {
             tracing::error!("Failed to connect to D-Bus session: {err}");
         })?
@@ -49,7 +49,42 @@ pub(super) async fn start_dbus_gateway(
             },
         )?
         .build()
-        .await
+        .await?;
+    warn_if_bus_lacks_process_fd(&connection).await;
+    Ok(connection)
+}
+
+/// Explains why requests fail on a bus that does not report `ProcessFD`.
+///
+/// credentialsd identifies each caller by the process file descriptor that the
+/// bus reports in `GetConnectionCredentials()`. dbus-broker and dbus-daemon
+/// 1.16 report it; dbus-daemon 1.14 does not. Without it, every request is
+/// rejected with `SecurityError`.
+const MISSING_PROCESS_FD_HELP: &str = "The D-Bus session bus does not report ProcessFD in \
+    GetConnectionCredentials(), so credentialsd cannot identify callers and will reject every \
+    request. Use dbus-broker, or dbus-daemon 1.16 or later.";
+
+/// Logs [`MISSING_PROCESS_FD_HELP`] once at startup if the bus does not report
+/// `ProcessFD` for this connection.
+async fn warn_if_bus_lacks_process_fd(connection: &Connection) {
+    match bus_reports_process_fd(connection).await {
+        Ok(true) => {}
+        Ok(false) => tracing::error!("{MISSING_PROCESS_FD_HELP}"),
+        Err(err) => tracing::warn!("Could not check whether the bus reports ProcessFD: {err}"),
+    }
+}
+
+/// Returns whether the bus reports `ProcessFD` in the credentials of this
+/// connection. Every connection on a given bus gets the same set of fields.
+async fn bus_reports_process_fd(connection: &Connection) -> zbus::Result<bool> {
+    let Some(name) = connection.unique_name() else {
+        return Ok(false);
+    };
+    let credentials = zbus::fdo::DBusProxy::new(connection)
+        .await?
+        .get_connection_credentials(BusName::from(name.to_owned()))
+        .await?;
+    Ok(credentials.process_fd().is_some())
 }
 
 /// Struct to hold state for the portal D-Bus interface.
@@ -666,7 +701,9 @@ async fn query_peer_pidfd(
     };
 
     let Some(pidfd) = peer_credentials.process_fd() else {
-        tracing::error!("Failed to get process fd from peer credentials");
+        tracing::error!(
+            "Failed to get process fd from peer credentials. {MISSING_PROCESS_FD_HELP}"
+        );
         return None;
     };
 
@@ -763,6 +800,14 @@ mod test {
         let (code, results) = decode_portal_result(Err(Error::NotAllowedError).into());
         assert_eq!(code, PortalResponse::Other as u32);
         assert!(results.contains_key("error"));
+    }
+
+    #[tokio::test]
+    async fn test_process_fd_check_answers_on_test_bus() {
+        // dbus-daemon 1.14 (Ubuntu 24.04) reports no ProcessFD and 1.16 does;
+        // either way the check must answer instead of failing.
+        let (connection, _bus) = connect_test_bus(None).await;
+        assert!(bus_reports_process_fd(&connection).await.is_ok());
     }
 
     #[tokio::test]

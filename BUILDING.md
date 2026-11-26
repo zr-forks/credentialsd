@@ -26,6 +26,16 @@ To build, you need the following utility packages and development library packag
 
 Using the web extension also requires `python3-dbus-next`.
 
+At run time, credentialsd also needs:
+
+- A D-Bus session bus that reports `ProcessFD` in `GetConnectionCredentials()`,
+  which credentialsd uses to identify callers: dbus-broker, or dbus-daemon 1.16
+  or later. dbus-daemon 1.14 (for example on Ubuntu 24.04) does not report it,
+  and credentialsd then rejects every request with `SecurityError`; it logs an
+  error explaining this at startup.
+- The system Public Suffix List, at `/usr/share/publicsuffix/` (the
+  `publicsuffix` package), to validate relying party IDs.
+
 ## Examples
 
 ### Debian/Ubuntu
