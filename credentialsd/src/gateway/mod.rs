@@ -398,20 +398,20 @@ fn check_origin_from_privileged_client(
     origin: &Origin,
     top_origin: Option<&Origin>,
 ) -> Result<NavigationContext, WebAuthnError> {
+    let allowed = |o: &Origin| o.is_web_origin_allowed_for_webauthn();
     match (origin, top_origin) {
-        (origin @ Origin::Https { .. }, None) => Ok(NavigationContext::SameOrigin(origin.clone())),
-        (origin @ Origin::Https { .. }, Some(top_origin @ Origin::Https { .. })) => {
-            if origin == top_origin {
-                Ok(NavigationContext::SameOrigin(origin.clone()))
-            } else {
-                Ok(NavigationContext::CrossOrigin((
-                    origin.clone(),
-                    top_origin.clone(),
-                )))
-            }
-        }
+        (origin, None) if allowed(origin) => Ok(NavigationContext::SameOrigin(origin.clone())),
+        // A top origin is only sent for requests from a nested browsing
+        // context, so treat it as cross-origin even when it equals the origin:
+        // there may be cross-origin frames in between (A -> B -> A).
+        // Otherwise the client data would report `crossOrigin: false`.
+        (origin, Some(top_origin)) if allowed(origin) && allowed(top_origin) => Ok(
+            NavigationContext::CrossOrigin((origin.clone(), top_origin.clone())),
+        ),
         _ => {
-            tracing::warn!("Caller requested non-HTTPS schemed origin, which is not supported.");
+            tracing::warn!(
+                "Caller requested an origin that is not https or http://localhost, which is not supported."
+            );
             Err(WebAuthnError::SecurityError)
         }
     }
@@ -562,8 +562,8 @@ mod test {
     use crate::webauthn::{AppId, NavigationContext, Origin};
 
     use super::{
-        RequestKind, WebAuthnError, check_origin_from_app, check_origin_from_privileged_client,
-        trusted_client_override,
+        RequestContext, RequestKind, WebAuthnError, check_origin_from_app,
+        check_origin_from_privileged_client, trusted_client_override, validate_request,
     };
 
     fn check_same_origin(origin: &str) -> Result<NavigationContext, WebAuthnError> {
@@ -584,6 +584,162 @@ mod test {
         assert!(matches!(
             check_same_origin("app:com.example.App"),
             Err(WebAuthnError::SecurityError)
+        ))
+    }
+
+    fn check_with_top_origin(
+        origin: &str,
+        top_origin: &str,
+    ) -> Result<NavigationContext, WebAuthnError> {
+        let origin = origin.parse().unwrap();
+        let top_origin = top_origin.parse().unwrap();
+        check_origin_from_privileged_client(&origin, Some(&top_origin))
+    }
+
+    #[test]
+    fn test_http_localhost_origin_returns_success() {
+        assert!(matches!(
+            check_same_origin("http://localhost"),
+            Ok(NavigationContext::SameOrigin(Origin::HttpLocalhost {
+                port: None
+            }))
+        ))
+    }
+
+    #[test]
+    fn test_http_localhost_origin_with_port_returns_success() {
+        assert!(matches!(
+            check_same_origin("http://localhost:8080"),
+            Ok(NavigationContext::SameOrigin(Origin::HttpLocalhost {
+                port: Some(8080)
+            }))
+        ))
+    }
+
+    #[test]
+    fn test_different_top_origin_is_cross_origin() {
+        let Ok(NavigationContext::CrossOrigin((origin, top_origin))) =
+            check_with_top_origin("https://idp.example.net", "https://example.com")
+        else {
+            panic!("expected a cross-origin context");
+        };
+        assert_eq!(origin.to_string(), "https://idp.example.net");
+        assert_eq!(top_origin.to_string(), "https://example.com");
+    }
+
+    #[test]
+    fn test_top_origin_equal_to_origin_is_still_cross_origin() {
+        // A -> B -> A: the browser sends the top origin because there is a
+        // cross-origin ancestor, even though the top origin equals the origin.
+        let Ok(NavigationContext::CrossOrigin((origin, top_origin))) =
+            check_with_top_origin("https://example.com", "https://example.com")
+        else {
+            panic!("expected a cross-origin context");
+        };
+        assert_eq!(origin, top_origin);
+    }
+
+    #[test]
+    fn test_http_localhost_top_origin_is_allowed() {
+        assert!(matches!(
+            check_with_top_origin("https://idp.example.net", "http://localhost:3000"),
+            Ok(NavigationContext::CrossOrigin((
+                Origin::Https { .. },
+                Origin::HttpLocalhost { port: Some(3000) }
+            )))
+        ))
+    }
+
+    #[test]
+    fn test_http_localhost_origin_in_cross_origin_context_is_allowed() {
+        assert!(matches!(
+            check_with_top_origin("http://localhost:3000", "https://example.com"),
+            Ok(NavigationContext::CrossOrigin((
+                Origin::HttpLocalhost { port: Some(3000) },
+                Origin::Https { .. }
+            )))
+        ))
+    }
+
+    #[test]
+    fn test_throws_security_error_when_passing_app_id_top_origin() {
+        assert!(matches!(
+            check_with_top_origin("https://example.com", "app:com.example.App"),
+            Err(WebAuthnError::SecurityError)
+        ))
+    }
+
+    #[test]
+    fn test_throws_security_error_when_passing_app_id_origin_with_top_origin() {
+        assert!(matches!(
+            check_with_top_origin("app:com.example.App", "https://example.com"),
+            Err(WebAuthnError::SecurityError)
+        ))
+    }
+
+    #[test]
+    fn test_privileged_client_keeps_top_origin_equal_to_origin() {
+        let app_id: AppId = "firefox".parse().unwrap();
+        let origin: Origin = "https://example.com".parse().unwrap();
+        let request_kind =
+            check_origin_from_app(&app_id, origin.clone(), Some(origin.clone())).unwrap();
+        let RequestKind::Privileged {
+            origin: request_origin,
+            top_origin: Some(top_origin),
+        } = request_kind
+        else {
+            panic!("expected a privileged cross-origin request");
+        };
+        assert_eq!(request_origin, origin);
+        assert_eq!(top_origin, origin);
+    }
+
+    #[test]
+    fn test_privileged_client_without_top_origin_is_same_origin() {
+        let app_id: AppId = "firefox".parse().unwrap();
+        let origin: Origin = "http://localhost:3000".parse().unwrap();
+        assert!(matches!(
+            check_origin_from_app(&app_id, origin, None).unwrap(),
+            RequestKind::Privileged {
+                origin: Origin::HttpLocalhost { port: Some(3000) },
+                top_origin: None,
+            }
+        ))
+    }
+
+    fn validate_privileged(
+        app_id: &str,
+        origin: &str,
+        top_origin: Option<&str>,
+    ) -> Result<NavigationContext, WebAuthnError> {
+        let app_id: AppId = app_id.parse().unwrap();
+        let request_kind = check_origin_from_app(
+            &app_id,
+            origin.parse().unwrap(),
+            top_origin.map(|o| o.parse().unwrap()),
+        )?;
+        validate_request(&RequestContext {
+            app_id,
+            pid: 0,
+            request_kind,
+        })
+    }
+
+    #[test]
+    fn test_validated_request_with_equal_top_origin_is_cross_origin() {
+        assert!(matches!(
+            validate_privileged("firefox", "https://example.com", Some("https://example.com")),
+            Ok(NavigationContext::CrossOrigin((origin, top_origin))) if origin == top_origin
+        ))
+    }
+
+    #[test]
+    fn test_validated_request_without_top_origin_is_same_origin() {
+        assert!(matches!(
+            validate_privileged("firefox", "http://localhost:8080", None),
+            Ok(NavigationContext::SameOrigin(Origin::HttpLocalhost {
+                port: Some(8080)
+            }))
         ))
     }
 

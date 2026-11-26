@@ -27,10 +27,12 @@ impl TryFrom<&Origin> for LibwebauthnOrigin {
 
     fn try_from(value: &Origin) -> Result<Self, Self::Error> {
         match value {
-            Origin::Https { .. } => value.to_string().parse().map_err(|err| {
-                tracing::info!("Cannot convert origin to libwebauthn Origin: {err}");
-                WebAuthnError::SecurityError
-            }),
+            Origin::Https { .. } | Origin::HttpLocalhost { .. } => {
+                value.to_string().parse().map_err(|err| {
+                    tracing::info!("Cannot convert origin to libwebauthn Origin: {err}");
+                    WebAuthnError::SecurityError
+                })
+            }
             // TODO: AppId support is being removed.
             Origin::AppId(_) => unimplemented!("AppId origins are not supported"),
         }
@@ -181,4 +183,158 @@ pub(super) fn get_credential_response_try_from_ctap2(
     Ok(GetPublicKeyCredentialResponse {
         authentication_response_json,
     })
+}
+
+#[cfg(test)]
+mod test {
+    use libwebauthn::ops::webauthn::idl::origin::RequestOrigin as LibwebauthnRequestOrigin;
+    use libwebauthn::ops::webauthn::{
+        OriginValidation, PublicSuffixList, RelatedOrigins, RequestSettings, SYSTEM_PSL_DAFSA_PATH,
+        SYSTEM_PSL_PATH,
+    };
+
+    use super::get_credential_request_try_into_ctap2;
+    use crate::gateway::{GetCredentialRequest, GetPublicKeyCredentialRequest, WebAuthnError};
+    use crate::webauthn::{GetAssertionRequest, NavigationContext, Origin};
+
+    /// "a challenge", base64url-encoded without padding.
+    const CHALLENGE: &str = "YSBjaGFsbGVuZ2U";
+
+    /// Treats the last label of a host as its public suffix, which is enough
+    /// for the hosts used in these tests.
+    struct LastLabelPublicSuffixList;
+
+    impl PublicSuffixList for LastLabelPublicSuffixList {
+        fn public_suffix(&self, host: &str) -> Option<String> {
+            host.rsplit('.').next().map(str::to_string)
+        }
+    }
+
+    fn origin(s: &str) -> Origin {
+        s.parse().unwrap()
+    }
+
+    fn request_json(rp_id: &str) -> String {
+        format!(r#"{{"challenge": "{CHALLENGE}", "rpId": "{rp_id}"}}"#)
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// Prepares a GetAssertion request the way the gateway does, validating
+    /// the RP ID against the origin, but with a fixed public suffix list.
+    fn prepare_get_assertion(
+        context: &NavigationContext,
+        rp_id: &str,
+    ) -> Result<GetAssertionRequest, WebAuthnError> {
+        let request_origin: LibwebauthnRequestOrigin = context.try_into()?;
+        let settings = RequestSettings {
+            origin: OriginValidation::Validate {
+                public_suffix_list: &LastLabelPublicSuffixList,
+                related_origins: RelatedOrigins::Disabled,
+            },
+        };
+        block_on(GetAssertionRequest::prepare(
+            &request_origin,
+            &request_json(rp_id),
+            &settings,
+        ))
+        .map_err(|_| WebAuthnError::SecurityError)
+    }
+
+    #[test]
+    fn test_same_origin_client_data_omits_top_origin() {
+        let context = NavigationContext::SameOrigin(origin("https://example.com"));
+        let request = prepare_get_assertion(&context, "example.com").unwrap();
+        assert_eq!(
+            request.client_data_json(),
+            format!(
+                r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"https://example.com","crossOrigin":false}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_cross_origin_client_data_with_equal_top_origin() {
+        // Issue #276: A -> B -> A must keep `crossOrigin: true`.
+        let context = NavigationContext::CrossOrigin((
+            origin("https://example.com"),
+            origin("https://example.com"),
+        ));
+        let request = prepare_get_assertion(&context, "example.com").unwrap();
+        assert_eq!(
+            request.client_data_json(),
+            format!(
+                r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"https://example.com","crossOrigin":true,"topOrigin":"https://example.com"}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_cross_origin_client_data_with_different_top_origin() {
+        let context = NavigationContext::CrossOrigin((
+            origin("https://idp.example.net"),
+            origin("https://example.com"),
+        ));
+        let request = prepare_get_assertion(&context, "example.net").unwrap();
+        assert_eq!(
+            request.client_data_json(),
+            format!(
+                r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"https://idp.example.net","crossOrigin":true,"topOrigin":"https://example.com"}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_http_localhost_client_data() {
+        // Issue #277: http://localhost is a valid WebAuthn origin.
+        let context = NavigationContext::SameOrigin(origin("http://localhost:3000"));
+        let request = prepare_get_assertion(&context, "localhost").unwrap();
+        assert_eq!(request.relying_party_id, "localhost");
+        assert_eq!(
+            request.client_data_json(),
+            format!(
+                r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"http://localhost:3000","crossOrigin":false}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_http_localhost_cannot_claim_other_rp_id() {
+        let context = NavigationContext::SameOrigin(origin("http://localhost:3000"));
+        assert!(prepare_get_assertion(&context, "example.com").is_err());
+    }
+
+    #[test]
+    fn test_https_origin_cannot_claim_localhost_rp_id() {
+        let context = NavigationContext::SameOrigin(origin("https://example.com"));
+        assert!(prepare_get_assertion(&context, "localhost").is_err());
+    }
+
+    /// Runs the gateway's conversion with the system public suffix list, as
+    /// the daemon does. Skipped when no system list is installed.
+    #[test]
+    fn test_http_localhost_with_system_public_suffix_list() {
+        if !std::path::Path::new(SYSTEM_PSL_DAFSA_PATH).exists()
+            && !std::path::Path::new(SYSTEM_PSL_PATH).exists()
+        {
+            eprintln!("Skipping: no system public suffix list installed");
+            return;
+        }
+        let request = GetCredentialRequest {
+            public_key: Some(GetPublicKeyCredentialRequest {
+                request_json: request_json("localhost"),
+            }),
+        };
+        let context = NavigationContext::SameOrigin(origin("http://localhost"));
+        let request = block_on(get_credential_request_try_into_ctap2(&request, &context)).unwrap();
+        assert_eq!(request.relying_party_id, "localhost");
+        assert_eq!(request.origin, "http://localhost");
+        assert_eq!(request.top_origin, None);
+    }
 }

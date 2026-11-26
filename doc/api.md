@@ -59,6 +59,8 @@ sequenceDiagram
 ### Improvements
 
 - Document errors returned to gateway requests
+- (Gateway): Permit `http://localhost` origins, as WebAuthn does (#277)
+- (Gateway): Treat requests with `top_origin` as cross-origin even if it is equal to `origin` (#276)
 
 ## [0.1.0] - 2025-08-14
 
@@ -228,18 +230,25 @@ CredentialType[s] [
 
 `origin` and `options.top_origin` define the request context. `origin` is required. A
 request is considered to be a cross-origin request if `options.top_origin` is
-specified. For certain credentials, cross-origin requests are not allowed and
+specified, even if it is equal to `origin`: a request from a document nested in
+a cross-origin frame of the same top-level origin (A -> B -> A) is still a
+cross-origin request. Clients must omit `options.top_origin` for same-origin
+requests. For certain credentials, cross-origin requests are not allowed and
 will be denied.
 
 At this time, only [web origins][web-origins] with HTTPS schemes are permitted
-for the `origin`, for example, `https://example.com`. No Unicode characters or
-Punyode are currently permitted.
+for `origin` and `options.top_origin`, for example, `https://example.com`. As
+[WebAuthn allows][webauthn-rp-id], an HTTP origin whose host is `localhost`
+is also permitted, for example, `http://localhost:8080`. Other loopback hosts,
+like `127.0.0.1`, are not. No Unicode characters or Punyode are currently
+permitted.
 
-The origin must be a registrable domain, not a top-level domain nor a public
-suffix, as defined by the [Public Suffix List][PSL].
+The origin must be a registrable domain or `localhost`, not a top-level domain
+nor a public suffix, as defined by the [Public Suffix List][PSL].
 
 [web-origins]: https://html.spec.whatwg.org/multipage/browsers.html#concept-origin-tuple
 [PSL]: https://github.com/publicsuffix/list
+[webauthn-rp-id]: https://www.w3.org/TR/webauthn-3/#rp-id
 
 #### UI backend
 

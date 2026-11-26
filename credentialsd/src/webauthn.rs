@@ -54,8 +54,29 @@ impl FromStr for AppId {
 /// The origin of the client for the request.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Origin {
-    Https { host: String, port: Option<u16> },
+    Https {
+        host: String,
+        port: Option<u16>,
+    },
+    /// An `http` origin whose host is `localhost`.
+    ///
+    /// [WebAuthn §4 (RP ID)][rp-id] allows the `http` scheme only when the
+    /// origin's host is `localhost`. Like libwebauthn, only the literal host
+    /// `localhost` is accepted, not other loopback names or addresses.
+    ///
+    /// [rp-id]: https://www.w3.org/TR/webauthn-3/#rp-id
+    HttpLocalhost {
+        port: Option<u16>,
+    },
     AppId(AppId),
+}
+
+impl Origin {
+    /// Returns true if WebAuthn ceremonies may run in this origin: an `https`
+    /// origin, or an `http` origin whose host is `localhost`.
+    pub(crate) fn is_web_origin_allowed_for_webauthn(&self) -> bool {
+        matches!(self, Origin::Https { .. } | Origin::HttpLocalhost { .. })
+    }
 }
 
 impl Display for Origin {
@@ -63,6 +84,12 @@ impl Display for Origin {
         match self {
             Origin::Https { host, port } => {
                 write!(f, "https://{}", host)?;
+                if let Some(port) = port {
+                    write!(f, ":{port}")?;
+                }
+            }
+            Origin::HttpLocalhost { port } => {
+                write!(f, "http://localhost")?;
                 if let Some(port) = port {
                     write!(f, ":{port}")?;
                 }
@@ -84,6 +111,9 @@ impl TryFrom<&Origin> for RelyingPartyId {
         match origin {
             Origin::Https { host, .. } => {
                 RelyingPartyId::try_from(host.as_str()).map_err(|_| OriginParseError::Host)
+            }
+            Origin::HttpLocalhost { .. } => {
+                RelyingPartyId::try_from("localhost").map_err(|_| OriginParseError::Host)
             }
             Origin::AppId(_) => Err(OriginParseError::Scheme),
         }
@@ -123,6 +153,22 @@ impl FromStr for Origin {
             };
 
             Ok(Origin::Https { host, port })
+        } else if let Some(rest) = s.strip_prefix("http://") {
+            let (host_candidate, port_candidate): (&str, Option<&str>) = rest
+                .split_once(':')
+                .map(|(h, p)| (h, Some(p)))
+                .unwrap_or((rest, None));
+
+            // The http scheme is only allowed for localhost.
+            if !host_candidate.eq_ignore_ascii_case("localhost") {
+                return Err(OriginParseError::Scheme);
+            }
+
+            let Ok(port) = port_candidate.map(|p| p.parse()).transpose() else {
+                return Err(OriginParseError::Port);
+            };
+
+            Ok(Origin::HttpLocalhost { port })
         } else if let Some(app_id_candidate) = s.strip_prefix("app:") {
             let app_id = app_id_candidate
                 .parse()
@@ -166,7 +212,7 @@ impl Display for OriginParseError {
 
 #[cfg(test)]
 mod tests {
-    use crate::webauthn::{Origin, OriginParseError};
+    use crate::webauthn::{Origin, OriginParseError, RelyingPartyId};
 
     fn check_https_origin(origin: &str, expected_host: &str, expected_port: Option<u16>) {
         let Origin::Https { host, port }: Origin = origin.parse().unwrap() else {
@@ -180,6 +226,84 @@ mod tests {
     fn test_origin_parse_when_http_fails() {
         let err = "http://example.com".parse::<Origin>().unwrap_err();
         assert!(matches!(err, OriginParseError::Scheme));
+    }
+
+    fn check_http_localhost_origin(origin: &str, expected_port: Option<u16>) {
+        let Origin::HttpLocalhost { port }: Origin = origin.parse().unwrap() else {
+            panic!("Not an http://localhost origin");
+        };
+        assert_eq!(expected_port, port);
+    }
+
+    #[test]
+    fn test_origin_parse_http_localhost_succeeds() {
+        check_http_localhost_origin("http://localhost", None);
+    }
+
+    #[test]
+    fn test_origin_parse_http_localhost_with_port_succeeds() {
+        check_http_localhost_origin("http://localhost:3000", Some(3000));
+    }
+
+    #[test]
+    fn test_origin_parse_http_localhost_is_case_insensitive() {
+        check_http_localhost_origin("http://LocalHost:3000", Some(3000));
+    }
+
+    #[test]
+    fn test_origin_parse_http_localhost_round_trips() {
+        for origin in ["http://localhost", "http://localhost:8080"] {
+            assert_eq!(origin.parse::<Origin>().unwrap().to_string(), origin);
+        }
+        assert_eq!(
+            "http://LOCALHOST".parse::<Origin>().unwrap().to_string(),
+            "http://localhost"
+        );
+    }
+
+    #[test]
+    fn test_origin_parse_http_localhost_with_invalid_port_fails() {
+        for origin in [
+            "http://localhost:",
+            "http://localhost:99999",
+            "http://localhost:80/",
+        ] {
+            let err = origin.parse::<Origin>().unwrap_err();
+            assert!(matches!(err, OriginParseError::Port), "{origin}");
+        }
+    }
+
+    #[test]
+    fn test_origin_parse_http_non_localhost_fails() {
+        for origin in [
+            "http://localhost.example.com",
+            "http://sub.localhost",
+            "http://127.0.0.1",
+            "http://[::1]",
+            "http://localhost/",
+            "http://evil.com#localhost",
+            "http://",
+        ] {
+            let err = origin.parse::<Origin>().unwrap_err();
+            assert!(matches!(err, OriginParseError::Scheme), "{origin}");
+        }
+    }
+
+    #[test]
+    fn test_http_localhost_relying_party_id_is_localhost() {
+        let origin: Origin = "http://localhost:3000".parse().unwrap();
+        let rp_id = RelyingPartyId::try_from(&origin).unwrap();
+        assert_eq!(rp_id.to_string(), "localhost");
+    }
+
+    #[test]
+    fn test_web_origins_are_allowed_for_webauthn() {
+        for origin in ["https://example.com", "http://localhost:3000"] {
+            let origin: Origin = origin.parse().unwrap();
+            assert!(origin.is_web_origin_allowed_for_webauthn());
+        }
+        let app: Origin = "app:com.example.App".parse().unwrap();
+        assert!(!app.is_web_origin_allowed_for_webauthn());
     }
 
     #[test]

@@ -22,6 +22,8 @@
 - ui: Pass the caller's activation token to the compositor when showing the dialog, so it can take focus when the requesting window is in the background (#152)
 - ui: Disable core dumps for the UI process, which handles typed PINs. Build with `-Denable_core_dumps=true` to allow them for debugging (#209)
 - ui: Don't crash when a request ends while the UI is still sending it events, e.g. because the caller disconnected right after starting it
+- daemon: Accept `http://localhost` origins from privileged clients, as WebAuthn allows (#277)
+- daemon: Report a request whose `top_origin` equals its `origin` as cross-origin, so the client data keeps `crossOrigin: true` for frames nested in a cross-origin frame (A -> B -> A) (#276)
 
 # 0.4.0 [2026-11-05]
 
